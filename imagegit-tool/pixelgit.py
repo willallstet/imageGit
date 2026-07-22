@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import gzip
+import io
 import json
 import math
 import sys
@@ -11,13 +13,14 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
 
 CENTRAL_NAME = "central.png"
 LOG_NAME = "pixel.git"
 META_NAME = "meta.json"
 REFS_NAME = "refs.json"
-DEFAULT_MAX_TOTAL_PIXELS = 1_500_000
+DEFAULT_MAX_TOTAL_PIXELS = 2_250_000  # 1500 x 1500
+DEFAULT_MAX_EDGE = 1500  # hard cap on width and height
 
 
 @dataclass
@@ -50,8 +53,20 @@ def hex_to_rgba(h: str) -> np.ndarray:
     return np.array([int(h[i:i+2], 16) for i in (0, 2, 4, 6)], dtype=np.uint8)
 
 
-def resize_to_max_total_pixels(img: Image.Image, max_total_pixels: int) -> Image.Image:
+def resize_to_max_total_pixels(
+    img: Image.Image,
+    max_total_pixels: int,
+    max_edge: int | None = DEFAULT_MAX_EDGE,
+) -> Image.Image:
     w, h = img.size
+
+    # First cap the longest edge so neither dimension exceeds max_edge.
+    if max_edge and (w > max_edge or h > max_edge):
+        edge_scale = min(max_edge / w, max_edge / h)
+        w = max(1, int(round(w * edge_scale)))
+        h = max(1, int(round(h * edge_scale)))
+        img = img.resize((w, h), Image.Resampling.LANCZOS)
+
     area = w * h
     if area <= max_total_pixels:
         return img
@@ -116,6 +131,34 @@ def diff_pixels(old_arr: np.ndarray, new_arr: np.ndarray):
 
 # ---------------- Log read/write ----------------
 
+# The pixel log is stored gzip-compressed on disk: a full-image change (e.g.
+# removing a background) can touch millions of pixels, and the plain-text form
+# blows past hosting file-size limits (GitHub caps blobs at 100 MB). Reads
+# transparently accept either gzip or legacy plain-text logs.
+
+def _log_is_gzip(path: Path) -> bool:
+    try:
+        with open(path, "rb") as f:
+            return f.read(2) == b"\x1f\x8b"
+    except OSError:
+        return False
+
+
+def open_log_text(path: Path):
+    """Open the log for reading as text, handling gzip or legacy plain text."""
+    if _log_is_gzip(path):
+        return gzip.open(path, "rt", encoding="utf-8")
+    return open(path, "rt", encoding="utf-8")
+
+
+def _ensure_log_gzip(path: Path) -> None:
+    """Migrate a plain-text (or empty) log file to gzip in place, once."""
+    if path.exists() and not _log_is_gzip(path):
+        data = path.read_bytes()
+        with gzip.open(path, "wb") as f:
+            f.write(data)
+
+
 def append_commit(
     log_path: Path,
     commit_id: str,
@@ -132,13 +175,41 @@ def append_commit(
     if branch is not None:
         payload["branch"] = branch
 
-    with log_path.open("a", encoding="utf-8") as f:
-        f.write(f"@commit\t{commit_id}\t{timestamp}\t{json.dumps(payload, separators=(',', ':'))}\n")
+    # Ensure the log is gzip, then append this commit as a new gzip member.
+    # Concatenated gzip members read back transparently as one stream.
+    #
+    # Write the new member to a temp file first, then atomically replace the
+    # log. Appending in-place with gzip is not crash-safe: Ctrl+C mid-write
+    # leaves a truncated member and a CRC failure on the next read.
+    _ensure_log_gzip(log_path)
+
+    member_buf = io.BytesIO()
+    with gzip.GzipFile(fileobj=member_buf, mode="wb", compresslevel=6) as gz:
+        # TextIO on top of GzipFile so we can write unicode in chunks.
+        # Batch lines — per-pixel write() is far too slow at ~2M pixels.
+        parts = [
+            f"@commit\t{commit_id}\t{timestamp}\t"
+            f"{json.dumps(payload, separators=(',', ':'))}\n"
+        ]
+        batch: list[str] = []
         for i in range(xs.shape[0]):
-            x = int(xs[i])
-            y = int(ys[i])
-            f.write(f"{x},{y}:{rgba_to_hex(olds[i])}>{rgba_to_hex(news[i])}\n")
-        f.write("@end\n")
+            batch.append(
+                f"{int(xs[i])},{int(ys[i])}:"
+                f"{rgba_to_hex(olds[i])}>{rgba_to_hex(news[i])}\n"
+            )
+            if len(batch) >= 8192:
+                parts.append("".join(batch))
+                batch.clear()
+        if batch:
+            parts.append("".join(batch))
+        parts.append("@end\n")
+        gz.write("".join(parts).encode("utf-8"))
+
+    member = member_buf.getvalue()
+    existing = log_path.read_bytes() if log_path.exists() else b""
+    tmp_path = log_path.with_name(log_path.name + ".tmp")
+    tmp_path.write_bytes(existing + member)
+    tmp_path.replace(log_path)
 
 
 def parse_log(log_path: Path) -> tuple[dict[str, Commit], list[str]]:
@@ -151,7 +222,7 @@ def parse_log(log_path: Path) -> tuple[dict[str, Commit], list[str]]:
     current = None
     xs = ys = olds = news = None
 
-    with log_path.open("r", encoding="utf-8") as f:
+    with open_log_text(log_path) as f:
         for raw in f:
             line = raw.rstrip("\n")
             if not line:
@@ -779,54 +850,76 @@ def cmd_merge(args):
         )
 
 
+def cmd_merge3(args):
+    """3-way pixel merge of standalone images (base/ours/theirs).
+
+    Semantics (same as git, per pixel):
+      - neither side edited vs base → keep base (via keeping ours, which matches)
+      - only ours edited → keep ours
+      - only theirs edited → take theirs
+      - both edited differently → prefer --prefer (ours|theirs)
+    """
+    def load(path: Path) -> Image.Image:
+        return Image.open(path).convert("RGBA")
+
+    base_im, ours_im, theirs_im = load(args.base), load(args.ours), load(args.theirs)
+    # Normalize to a shared canvas (base size) so plain git / resized edits still merge.
+    target = base_im.size
+    if ours_im.size != target:
+        print(f"Auto-resizing ours {ours_im.size} -> {target}")
+        ours_im = ours_im.resize(target, Image.Resampling.LANCZOS)
+    if theirs_im.size != target:
+        print(f"Auto-resizing theirs {theirs_im.size} -> {target}")
+        theirs_im = theirs_im.resize(target, Image.Resampling.LANCZOS)
+
+    base = np.array(base_im, dtype=np.uint8)
+    ours = np.array(ours_im, dtype=np.uint8)
+    theirs = np.array(theirs_im, dtype=np.uint8)
+
+    eq_ob = np.all(ours == base, axis=2)
+    eq_tb = np.all(theirs == base, axis=2)
+    eq_ot = np.all(ours == theirs, axis=2)
+
+    only_ours = (~eq_ob) & eq_tb
+    only_theirs = eq_ob & (~eq_tb)
+    conflicts = (~eq_ot) & (~eq_ob) & (~eq_tb)
+    neither = eq_ob & eq_tb
+    both_same = eq_ot & (~eq_ob)  # both edited to the same value
+
+    conflict_count = int(np.count_nonzero(conflicts))
+    print(
+        f"Pixels: neither={int(np.count_nonzero(neither))}  "
+        f"only-ours={int(np.count_nonzero(only_ours))}  "
+        f"only-theirs={int(np.count_nonzero(only_theirs))}  "
+        f"both-same={int(np.count_nonzero(both_same))}  "
+        f"conflict={conflict_count}"
+    )
+
+    merged = ours.copy()
+    merged[only_theirs] = theirs[only_theirs]
+
+    if conflict_count > 0:
+        if args.prefer == "theirs":
+            merged[conflicts] = theirs[conflicts]
+        # "ours" keeps merged as-is
+        print(f"Conflicts resolved with prefer={args.prefer}.")
+    else:
+        print("No conflicting pixels.")
+
+    Image.fromarray(merged).save(args.output)
+    print(f"Wrote merged image -> {args.output} ({merged.shape[1]} x {merged.shape[0]})")
+
+
 # ---------------- Lineage visualization ----------------
 
-# Branch lane colors (GitHub-ish palette).
+# Branch lane colors: red, green, blue.
 LANE_PALETTE = [
-    (88, 166, 255),   # blue
-    (63, 185, 80),    # green
-    (219, 119, 40),   # orange
-    (188, 140, 255),  # purple
-    (247, 129, 102),  # salmon
-    (219, 119, 189),  # pink
-    (121, 192, 255),  # light blue
-    (210, 153, 34),   # gold
+    (255, 0, 0),     # #FF0000
+    (0, 255, 0),     # #00FF00
+    (0, 0, 255),     # #0000FF
 ]
-BG_COLOR = (13, 17, 23)          # dark background
-FG_COLOR = (230, 237, 243)       # primary text
-MUTED_COLOR = (139, 148, 158)    # secondary text
-HEAD_PILL = (56, 139, 253)       # HEAD decoration
-
-
-def _load_font(size: int, bold: bool = False):
-    regular = [
-        "/System/Library/Fonts/Supplemental/Arial.ttf",
-        "/Library/Fonts/Arial.ttf",
-        "DejaVuSans.ttf",
-        "Arial.ttf",
-    ]
-    boldfonts = [
-        "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
-        "/Library/Fonts/Arial Bold.ttf",
-        "DejaVuSans-Bold.ttf",
-        "Arial Bold.ttf",
-    ]
-    for name in (boldfonts if bold else regular):
-        try:
-            return ImageFont.truetype(name, size)
-        except Exception:
-            continue
-    return ImageFont.load_default()
-
-
-def _draw_arrow(draw, p0, p1, color, width=6, head=22):
-    """Draw a line from p0 to p1 with an arrowhead at p1."""
-    draw.line([p0, p1], fill=color, width=width)
-    ang = math.atan2(p1[1] - p0[1], p1[0] - p0[0])
-    for da in (math.radians(150), math.radians(-150)):
-        hx = p1[0] + head * math.cos(ang + da)
-        hy = p1[1] + head * math.sin(ang + da)
-        draw.line([p1, (hx, hy)], fill=color, width=width)
+BG_COLOR = (255, 255, 255)       # plain white background
+LINE_WIDTH = 50
 
 
 def _reconstruct_image(repo, central_arr, head_commit, cid, commits) -> Image.Image:
@@ -840,7 +933,135 @@ def _reconstruct_image(repo, central_arr, head_commit, cid, commits) -> Image.Im
     return bg
 
 
-def render_lineage(repo: Path, commits: dict[str, Commit], order: list[str], refs: dict, out_path: Path) -> None:
+def render_lineage_dag(
+    nodes: dict[str, dict],
+    order: list[str],
+    out_path: Path,
+    title: str = "PixelGit lineage",
+    orientation: str = "vertical",
+) -> None:
+    """Render an arbitrary commit DAG to an image.
+
+    Images only — no text, no outlines. Colored lines connect parents to children.
+
+    ``nodes[id]`` is a dict describing one node:
+      parents      list[str]        parent ids (edges parent -> child)
+      lane         str              lane/branch key (drives column + color)
+      image        PIL.Image.Image  node image (any mode; coerced to RGB)
+
+    Extra keys (decorations, message, label, merge, ...) are ignored.
+
+    ``order`` lists the ids oldest-first.
+
+    ``orientation`` is ``"vertical"`` (default: oldest at top, history flows
+    down; lanes are columns) or ``"horizontal"`` (oldest at left, history
+    flows right; lanes are rows).
+
+    ``title`` is accepted for API compatibility but not drawn.
+    """
+    del title  # unused; kept for callers
+    if not order:
+        raise ValueError("No commits to graph.")
+    if orientation not in ("vertical", "horizontal"):
+        raise ValueError(f"orientation must be 'vertical' or 'horizontal', got {orientation!r}")
+    horizontal = orientation == "horizontal"
+
+    # Assign a lane index per lane key, in first-appearance order.
+    idx_of_lane: dict[str, int] = {}
+    for cid in order:
+        k = nodes[cid]["lane"]
+        if k not in idx_of_lane:
+            idx_of_lane[k] = len(idx_of_lane)
+    nlanes = max(1, len(idx_of_lane))
+
+    # Depth = longest path from a root, so siblings (e.g. both sides of a
+    # branch) share a depth and the merge forms a clear diamond.
+    depth_of: dict[str, int] = {}
+    for cid in order:
+        parents = [p for p in nodes[cid]["parents"] if p in depth_of or p in nodes]
+        known = [depth_of[p] for p in parents if p in depth_of]
+        depth_of[cid] = (1 + max(known)) if known else 0
+    ndepths = 1 + max(depth_of.values())
+
+    # Coerce every node image to RGB and normalize to a common size.
+    imgs: dict[str, Image.Image] = {}
+    for cid in order:
+        im = nodes[cid]["image"]
+        imgs[cid] = im if im.mode == "RGB" else im.convert("RGB")
+    iw, ih = imgs[order[0]].size
+    for cid in order:
+        if imgs[cid].size != (iw, ih):
+            imgs[cid] = imgs[cid].resize((iw, ih), Image.Resampling.LANCZOS)
+
+    gap_x = max(80, iw // 6)
+    gap_y = max(140, ih // 6)
+    left = 48
+    top = 48
+    cell_w = iw + gap_x
+    cell_h = ih + gap_y
+
+    if horizontal:
+        # Time → columns (left→right); lanes → rows (top→bottom).
+        width = int(left + (ndepths - 1) * cell_w + iw + 48)
+        height = int(top * 2 + (nlanes - 1) * cell_h + ih)
+    else:
+        # Lanes → columns; time → rows (top→bottom).
+        width = int(left * 2 + (nlanes - 1) * cell_w + iw)
+        height = int(top + (ndepths - 1) * cell_h + ih + 48)
+
+    img = Image.new("RGB", (width, height), BG_COLOR)
+    draw = ImageDraw.Draw(img)
+
+    def lane_color(cid: str) -> tuple[int, int, int]:
+        return LANE_PALETTE[idx_of_lane[nodes[cid]["lane"]] % len(LANE_PALETTE)]
+
+    def image_box(cid: str) -> tuple[int, int, int, int]:
+        lane = idx_of_lane[nodes[cid]["lane"]]
+        depth = depth_of[cid]
+        if horizontal:
+            x = left + depth * cell_w
+            y = top + lane * cell_h
+        else:
+            x = left + lane * cell_w
+            y = top + depth * cell_h
+        return x, y, x + iw, y + ih
+
+    # Lines: each parent connects to its child. First-parent edges use the
+    # child's lane color; extra (merge-in) parents keep their own lane color
+    # so the side branch visibly rejoins.
+    for cid in order:
+        parents = [p for p in nodes[cid]["parents"] if p in depth_of]
+        cbx0, cby0, cbx1, cby1 = image_box(cid)
+        if horizontal:
+            end = (cbx0, (cby0 + cby1) // 2)
+        else:
+            end = ((cbx0 + cbx1) // 2, cby0)
+        for i, p in enumerate(parents):
+            pbx0, pby0, pbx1, pby1 = image_box(p)
+            if horizontal:
+                start = (pbx1, (pby0 + pby1) // 2)
+            else:
+                start = ((pbx0 + pbx1) // 2, pby1)
+            color = lane_color(cid) if i == 0 else lane_color(p)
+            draw.line([start, end], fill=color, width=LINE_WIDTH)
+
+    # Images only — no frames, no labels.
+    for cid in order:
+        bx0, by0, _, _ = image_box(cid)
+        img.paste(imgs[cid], (bx0, by0))
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    img.save(out_path)
+
+
+def render_lineage(
+    repo: Path,
+    commits: dict[str, Commit],
+    order: list[str],
+    refs: dict,
+    out_path: Path,
+    orientation: str = "vertical",
+) -> None:
     if not order:
         raise ValueError("No commits to graph.")
 
@@ -852,111 +1073,23 @@ def render_lineage(repo: Path, commits: dict[str, Commit], order: list[str], ref
     for b, cid in refs["branches"].items():
         branch_heads.setdefault(cid, []).append(b)
 
-    def branch_key(cid: str) -> str:
-        b = commits[cid].branch
-        return b if b is not None else "(detached)"
-
-    # Assign a column (lane) per branch, in first-appearance order.
-    col_of_branch: dict[str, int] = {}
+    nodes: dict[str, dict] = {}
     for cid in order:
-        k = branch_key(cid)
-        if k not in col_of_branch:
-            col_of_branch[k] = len(col_of_branch)
-    ncols = max(1, len(col_of_branch))
-
-    # Newest commit at the top.
-    rows = list(reversed(order))
-    row_of = {cid: i for i, cid in enumerate(rows)}
-
-    # Reconstruct every commit's full-resolution image.
-    imgs = {cid: _reconstruct_image(repo, central_arr, head_commit, cid, commits) for cid in rows}
-    iw, ih = imgs[rows[0]].size
-
-    font_id = _load_font(max(22, iw // 26), bold=True)
-    font_msg = _load_font(max(18, iw // 32))
-    font_small = _load_font(max(16, iw // 36))
-    font_title = _load_font(max(28, iw // 20), bold=True)
-
-    measure = ImageDraw.Draw(Image.new("RGB", (4, 4)))
-
-    def tw(txt: str, f) -> int:
-        box = measure.textbbox((0, 0), txt, font=f)
-        return box[2] - box[0]
-
-    def th(txt: str, f) -> int:
-        box = measure.textbbox((0, 0), txt, font=f)
-        return box[3] - box[1]
-
-    label_h = th("Ag", font_id) + 26
-    border = 5
-    gap_x = max(80, iw // 6)
-    gap_y = max(140, ih // 6)
-    left = 48
-    top = th("Ag", font_title) + 48
-    lane_w = iw + 2 * border + gap_x
-    row_h = ih + 2 * border + label_h + gap_y
-
-    width = int(left * 2 + (ncols - 1) * lane_w + iw + 2 * border)
-    height = int(top + len(rows) * row_h)
-
-    img = Image.new("RGB", (width, height), BG_COLOR)
-    draw = ImageDraw.Draw(img)
-    draw.text((left, 24), "PixelGit lineage", font=font_title, fill=FG_COLOR)
-
-    def lane_color(cid: str) -> tuple[int, int, int]:
-        return LANE_PALETTE[col_of_branch[branch_key(cid)] % len(LANE_PALETTE)]
-
-    def cell_xy(cid: str) -> tuple[int, int]:
-        col = col_of_branch[branch_key(cid)]
-        return left + col * lane_w, top + row_of[cid] * row_h
-
-    def image_box(cid: str) -> tuple[int, int, int, int]:
-        x, y = cell_xy(cid)
-        iy = y + label_h
-        return x + border, iy + border, x + border + iw, iy + border + ih
-
-    # Arrows: each commit points down to its parent(s).
-    for cid in rows:
-        bx0, by0, bx1, by1 = image_box(cid)
-        start = ((bx0 + bx1) // 2, by1 + border)
-        for p in commits[cid].parents:
-            if p not in row_of:
-                continue
-            px0, py0, px1, py1 = image_box(p)
-            end = ((px0 + px1) // 2, py0 - border)
-            _draw_arrow(draw, start, end, lane_color(cid))
-
-    # Each node: label above, then the full image with a colored branch frame.
-    for cid in rows:
         c = commits[cid]
-        cx, cy = cell_xy(cid)
-        bx0, by0, bx1, by1 = image_box(cid)
-        color = lane_color(cid)
-
-        # colored frame (double thickness for merge commits)
-        fw = border * 2 if len(c.parents) > 1 else border
-        draw.rectangle([bx0 - fw, by0 - fw, bx1 + fw, by1 + fw], outline=color, width=fw)
-        img.paste(imgs[cid], (bx0, by0))
-
-        # label row above the image
         deco = list(branch_heads.get(cid, []))
         if cid == head_commit:
             deco.append("HEAD" if head_is_branch else "HEAD (detached)")
-        ly = cy + 4
-        draw.text((cx, ly), cid, font=font_id, fill=FG_COLOR)
-        lx = cx + tw(cid, font_id) + 16
-        pill_h = th("Ag", font_small) + 12
-        for name in deco:
-            pill = HEAD_PILL if name.startswith("HEAD") else color
-            nw = tw(name, font_small)
-            draw.rounded_rectangle([lx, ly, lx + nw + 20, ly + pill_h], radius=pill_h // 2, fill=pill)
-            draw.text((lx + 10, ly + 5), name, font=font_small, fill=(255, 255, 255))
-            lx += nw + 20 + 10
-        if c.message:
-            draw.text((lx + 4, ly + 3), c.message, font=font_msg, fill=MUTED_COLOR)
+        nodes[cid] = {
+            "parents": list(c.parents),
+            "lane": c.branch if c.branch is not None else "(detached)",
+            "decorations": deco,
+            "message": c.message,
+            "image": _reconstruct_image(repo, central_arr, head_commit, cid, commits),
+            "label": cid,
+            "merge": len(c.parents) > 1,
+        }
 
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    img.save(out_path)
+    render_lineage_dag(nodes, order, out_path, orientation=orientation)
 
 
 def cmd_graph(args):
@@ -964,7 +1097,7 @@ def cmd_graph(args):
     refs = load_refs(repo)
     commits, order = parse_log(repo / LOG_NAME)
     out = Path(args.output) if args.output else repo / "lineage.png"
-    render_lineage(repo, commits, order, refs, out)
+    render_lineage(repo, commits, order, refs, out, orientation=args.orientation)
     w, h = Image.open(out).size
     print(f"Wrote lineage graph: {out} ({len(order)} commits, {w}x{h})")
 
@@ -1034,9 +1167,31 @@ def build_parser():
     )
     p_merge.set_defaults(func=cmd_merge)
 
+    p_merge3 = sub.add_parser(
+        "merge3",
+        help="3-way pixel merge of standalone base/ours/theirs images (e.g. across git worktrees)",
+    )
+    p_merge3.add_argument("base", help="Shared-ancestor image")
+    p_merge3.add_argument("ours", help="Our image (kept on conflict when --prefer ours)")
+    p_merge3.add_argument("theirs", help="Their image")
+    p_merge3.add_argument("-o", "--output", required=True, help="Output image path")
+    p_merge3.add_argument(
+        "--prefer",
+        choices=["ours", "theirs"],
+        default="ours",
+        help="Which side wins on conflicting pixels (default: ours)",
+    )
+    p_merge3.set_defaults(func=cmd_merge3)
+
     p_graph = sub.add_parser("graph", help="Render the commit lineage to an image")
     p_graph.add_argument("repo", help="Repo directory")
     p_graph.add_argument("-o", "--output", default=None, help="Output image path (default: <repo>/lineage.png)")
+    p_graph.add_argument(
+        "--orientation",
+        choices=["vertical", "horizontal"],
+        default="vertical",
+        help="Layout direction: vertical (default, history top→bottom) or horizontal (history left→right)",
+    )
     p_graph.set_defaults(func=cmd_graph)
 
     p_config = sub.add_parser("config", help="View or set repo configuration")
