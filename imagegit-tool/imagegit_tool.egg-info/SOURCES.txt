@@ -1,0 +1,9 @@
+imagegit.py
+pixelgit.py
+pyproject.toml
+imagegit_tool.egg-info/PKG-INFO
+imagegit_tool.egg-info/SOURCES.txt
+imagegit_tool.egg-info/dependency_links.txt
+imagegit_tool.egg-info/entry_points.txt
+imagegit_tool.egg-info/requires.txt
+imagegit_tool.egg-info/top_level.txt
