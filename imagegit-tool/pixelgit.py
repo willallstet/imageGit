@@ -912,14 +912,67 @@ def cmd_merge3(args):
 
 # ---------------- Lineage visualization ----------------
 
-# Branch lane colors: red, green, blue.
+# Branch lane colors: red, blue, green (Frame 18 palette).
 LANE_PALETTE = [
     (255, 0, 0),     # #FF0000
-    (0, 255, 0),     # #00FF00
     (0, 0, 255),     # #0000FF
+    (0, 255, 0),     # #00FF00
 ]
 BG_COLOR = (255, 255, 255)       # plain white background
 LINE_WIDTH = 50
+# Frame 18: minimum clear space between consecutive row image boxes.
+MIN_ROW_GAP = 917
+
+
+def _cubic_bezier(
+    p0: tuple[float, float],
+    p1: tuple[float, float],
+    p2: tuple[float, float],
+    p3: tuple[float, float],
+    n: int,
+) -> list[tuple[float, float]]:
+    pts: list[tuple[float, float]] = []
+    for i in range(n + 1):
+        t = i / n
+        u = 1.0 - t
+        x = u**3 * p0[0] + 3 * u**2 * t * p1[0] + 3 * u * t**2 * p2[0] + t**3 * p3[0]
+        y = u**3 * p0[1] + 3 * u**2 * t * p1[1] + 3 * u * t**2 * p2[1] + t**3 * p3[1]
+        pts.append((x, y))
+    return pts
+
+
+def _draw_connector(
+    draw: ImageDraw.ImageDraw,
+    start: tuple[float, float],
+    end: tuple[float, float],
+    color: tuple[int, int, int],
+    width: int,
+    *,
+    horizontal: bool,
+) -> None:
+    """Thick rounded connector: straight when aligned, S-curve when lanes differ.
+
+    Stamps overlapping discs along a cubic bezier so thick strokes stay smooth
+    (Pillow's thick polylines can look hatched at joints).
+    """
+    sx, sy = start
+    ex, ey = end
+    if horizontal:
+        mid_x = (sx + ex) / 2.0
+        c1 = (mid_x, sy)
+        c2 = (mid_x, ey)
+    else:
+        mid_y = (sy + ey) / 2.0
+        c1 = (sx, mid_y)
+        c2 = (ex, mid_y)
+    dist = math.hypot(ex - sx, ey - sy)
+    # Step ~1/3 of the radius so discs overlap into a solid tube.
+    step = max(1.0, width / 6.0)
+    n = max(8, int(dist / step))
+    pts = _cubic_bezier(start, c1, c2, end, n)
+    r = width / 2.0
+    for x, y in pts:
+        draw.ellipse((x - r, y - r, x + r, y + r), fill=color)
 
 
 def _reconstruct_image(repo, central_arr, head_commit, cid, commits) -> Image.Image:
@@ -938,25 +991,25 @@ def render_lineage_dag(
     order: list[str],
     out_path: Path,
     title: str = "PixelGit lineage",
-    orientation: str = "vertical",
+    orientation: str = "horizontal",
 ) -> None:
     """Render an arbitrary commit DAG to an image.
 
-    Images only — no text, no outlines. Colored lines connect parents to children.
+    Images only — no text, no outlines. Thick colored S-curve connectors
+    (Frame 18 style) link parents to children.
 
     ``nodes[id]`` is a dict describing one node:
       parents      list[str]        parent ids (edges parent -> child)
       lane         str              lane/branch key (drives column + color)
       image        PIL.Image.Image  node image (any mode; coerced to RGB)
 
-    Extra keys (decorations, message, label, merge, ...) are ignored.
+    Layout matches Figma Frame 18:
+      * Root, merges, and post-merge commits sit on a shared center rail.
+      * Side branches fan above/below that center.
+      * Each commit is drawn once (no duplicate placements).
+      * Consecutive rows are separated by at least ``MIN_ROW_GAP`` pixels.
 
-    ``order`` lists the ids oldest-first.
-
-    ``orientation`` is ``"vertical"`` (default: oldest at top, history flows
-    down; lanes are columns) or ``"horizontal"`` (oldest at left, history
-    flows right; lanes are rows).
-
+    ``orientation`` is ``"horizontal"`` (default) or ``"vertical"``.
     ``title`` is accepted for API compatibility but not drawn.
     """
     del title  # unused; kept for callers
@@ -966,24 +1019,99 @@ def render_lineage_dag(
         raise ValueError(f"orientation must be 'vertical' or 'horizontal', got {orientation!r}")
     horizontal = orientation == "horizontal"
 
-    # Assign a lane index per lane key, in first-appearance order.
+    # One node per id — duplicate ids in ``order`` would re-paste the same photo.
+    seen_ids: set[str] = set()
+    order = [c for c in order if c in nodes and not (c in seen_ids or seen_ids.add(c))]
+    if not order:
+        raise ValueError("No commits to graph.")
+
+    # Branch colors in first-appearance order (red / blue / …).
     idx_of_lane: dict[str, int] = {}
     for cid in order:
         k = nodes[cid]["lane"]
         if k not in idx_of_lane:
             idx_of_lane[k] = len(idx_of_lane)
-    nlanes = max(1, len(idx_of_lane))
 
-    # Depth = longest path from a root, so siblings (e.g. both sides of a
-    # branch) share a depth and the merge forms a clear diamond.
+    # Depth = longest path from a root (column along history).
     depth_of: dict[str, int] = {}
     for cid in order:
         parents = [p for p in nodes[cid]["parents"] if p in depth_of or p in nodes]
         known = [depth_of[p] for p in parents if p in depth_of]
         depth_of[cid] = (1 + max(known)) if known else 0
-    ndepths = 1 + max(depth_of.values())
 
-    # Coerce every node image to RGB and normalize to a common size.
+    # Slot: 0 = center rail (root / merge / green continuation).
+    # Side branches get ±1, ±2, … alternating above/below — Frame 18 style.
+    slot_of: dict[str, int] = {}
+    color_idx: dict[str, int] = {}
+    on_merge_rail: set[str] = set()  # merge + first-parent descendants (green)
+    branch_slot: dict[str, int] = {}
+    side_pattern = (-1, 1, -2, 2, -3, 3, -4, 4)
+    side_i = 0
+    next_merge_color = max(2, len(idx_of_lane))  # prefer green (index 2) for first merge
+
+    for cid in order:
+        parents = [p for p in nodes[cid]["parents"] if p in slot_of]
+        lane = nodes[cid]["lane"]
+
+        if not parents:
+            slot_of[cid] = 0
+            color_idx[cid] = idx_of_lane[lane]
+        elif len(parents) > 1:
+            slot_of[cid] = 0
+            color_idx[cid] = next_merge_color
+            next_merge_color += 1
+            on_merge_rail.add(cid)
+        elif parents[0] in on_merge_rail:
+            p = parents[0]
+            slot_of[cid] = 0
+            color_idx[cid] = color_idx[p]
+            on_merge_rail.add(cid)
+        elif slot_of[parents[0]] == 0:
+            # Branching off the root/center: fan out above/below.
+            # Pure linear history (single lane) stays centered.
+            if len(idx_of_lane) == 1:
+                slot_of[cid] = 0
+                color_idx[cid] = idx_of_lane[lane]
+            else:
+                if lane not in branch_slot:
+                    branch_slot[lane] = side_pattern[side_i % len(side_pattern)]
+                    side_i += 1
+                slot_of[cid] = branch_slot[lane]
+                color_idx[cid] = idx_of_lane[lane]
+        else:
+            if lane not in branch_slot:
+                parent_slot = slot_of[parents[0]]
+                direction = 1 if parent_slot >= 0 else -1
+                branch_slot[lane] = parent_slot + direction
+                taken = set(branch_slot.values()) | {0}
+                while branch_slot[lane] in taken:
+                    branch_slot[lane] += direction
+            slot_of[cid] = branch_slot[lane]
+            color_idx[cid] = idx_of_lane[lane]
+
+    # Compact used slots to contiguous rows (preserve vertical order).
+    used_slots = sorted(set(slot_of.values()))
+    slot_to_row = {s: i for i, s in enumerate(used_slots)}
+    row_of = {c: slot_to_row[slot_of[c]] for c in order}
+
+    # Same depth+row would stack two photos on one cell ("doubling").
+    # Resolve by pushing the later commit to the next free column instead of
+    # inventing an extra overlapping row.
+    col_of = {c: depth_of[c] for c in order}
+    used_cells: dict[tuple[int, int], str] = {}
+    for cid in order:
+        key = (col_of[cid], row_of[cid])
+        if key not in used_cells:
+            used_cells[key] = cid
+            continue
+        # Bump column until the (col, row) slot is free.
+        col = col_of[cid] + 1
+        while (col, row_of[cid]) in used_cells:
+            col += 1
+        col_of[cid] = col
+        used_cells[(col, row_of[cid])] = cid
+
+    # Coerce images to RGB + common size.
     imgs: dict[str, Image.Image] = {}
     for cid in order:
         im = nodes[cid]["image"]
@@ -993,65 +1121,113 @@ def render_lineage_dag(
         if imgs[cid].size != (iw, ih):
             imgs[cid] = imgs[cid].resize((iw, ih), Image.Resampling.LANCZOS)
 
-    gap_x = max(80, iw // 6)
-    gap_y = max(140, ih // 6)
+    # Frame 18 spacing: ≥ MIN_ROW_GAP clear pixels between row boxes;
+    # horizontal gap ~0.6× image width (measured from Frame 18).
+    gap_along = max(LINE_WIDTH * 2, int(round(iw * 0.61)))
+    gap_across = MIN_ROW_GAP
     left = 48
     top = 48
-    cell_w = iw + gap_x
-    cell_h = ih + gap_y
+    if horizontal:
+        gap_x, gap_y = gap_along, gap_across
+    else:
+        gap_x, gap_y = gap_across, gap_along
+    step_x = iw + gap_x
+    step_y = ih + gap_y
+
+    used_cols = sorted({col_of[c] for c in order})
+    col_compact = {c: i for i, c in enumerate(used_cols)}
+    ncols = len(used_cols)
+
+    used_rows = sorted({row_of[c] for c in order})
+    row_compact = {r: i for i, r in enumerate(used_rows)}
+    nrows = len(used_rows)
 
     if horizontal:
-        # Time → columns (left→right); lanes → rows (top→bottom).
-        width = int(left + (ndepths - 1) * cell_w + iw + 48)
-        height = int(top * 2 + (nlanes - 1) * cell_h + ih)
+        width = int(left + (ncols - 1) * step_x + iw + 48)
+        height = int(top * 2 + (nrows - 1) * step_y + ih)
     else:
-        # Lanes → columns; time → rows (top→bottom).
-        width = int(left * 2 + (nlanes - 1) * cell_w + iw)
-        height = int(top + (ndepths - 1) * cell_h + ih + 48)
+        width = int(left * 2 + (nrows - 1) * step_x + iw)
+        height = int(top + (ncols - 1) * step_y + ih + 48)
 
     img = Image.new("RGB", (width, height), BG_COLOR)
     draw = ImageDraw.Draw(img)
 
-    def lane_color(cid: str) -> tuple[int, int, int]:
-        return LANE_PALETTE[idx_of_lane[nodes[cid]["lane"]] % len(LANE_PALETTE)]
+    def node_color(cid: str) -> tuple[int, int, int]:
+        return LANE_PALETTE[color_idx[cid] % len(LANE_PALETTE)]
 
     def image_box(cid: str) -> tuple[int, int, int, int]:
-        lane = idx_of_lane[nodes[cid]["lane"]]
-        depth = depth_of[cid]
+        col = col_compact[col_of[cid]]
+        row = row_compact[row_of[cid]]
         if horizontal:
-            x = left + depth * cell_w
-            y = top + lane * cell_h
+            x = left + col * step_x
+            y = top + row * step_y
         else:
-            x = left + lane * cell_w
-            y = top + depth * cell_h
-        return x, y, x + iw, y + ih
+            x = left + row * step_x
+            y = top + col * step_y
+        return int(x), int(y), int(x + iw), int(y + ih)
 
-    # Lines: each parent connects to its child. First-parent edges use the
-    # child's lane color; extra (merge-in) parents keep their own lane color
-    # so the side branch visibly rejoins.
-    for cid in order:
-        parents = [p for p in nodes[cid]["parents"] if p in depth_of]
-        cbx0, cby0, cbx1, cby1 = image_box(cid)
-        if horizontal:
-            end = (cbx0, (cby0 + cby1) // 2)
-        else:
-            end = ((cbx0 + cbx1) // 2, cby0)
-        for i, p in enumerate(parents):
-            pbx0, pby0, pbx1, pby1 = image_box(p)
-            if horizontal:
-                start = (pbx1, (pby0 + pby1) // 2)
+    # Sanity: no two image boxes may overlap; cross-axis clearance ≥ MIN_ROW_GAP.
+    boxes = {c: image_box(c) for c in order}
+    for i, a in enumerate(order):
+        ax0, ay0, ax1, ay1 = boxes[a]
+        for b in order[i + 1 :]:
+            bx0, by0, bx1, by1 = boxes[b]
+            if ax1 <= bx0:
+                gx = bx0 - ax1
+            elif bx1 <= ax0:
+                gx = ax0 - bx1
             else:
-                start = ((pbx0 + pbx1) // 2, pby1)
-            color = lane_color(cid) if i == 0 else lane_color(p)
-            draw.line([start, end], fill=color, width=LINE_WIDTH)
+                gx = -1
+            if ay1 <= by0:
+                gy = by0 - ay1
+            elif by1 <= ay0:
+                gy = ay0 - by1
+            else:
+                gy = -1
+            if gx < 0 and gy < 0:
+                raise RuntimeError(
+                    f"Lineage layout overlap: {a[:7]} and {b[:7]} share the same cell region"
+                )
+            # Rows share a column band (x-overlap when horizontal) → enforce MIN_ROW_GAP on y.
+            if horizontal and gx < 0 and 0 <= gy < MIN_ROW_GAP:
+                raise RuntimeError(
+                    f"Lineage row gap {gy}px < MIN_ROW_GAP {MIN_ROW_GAP}px "
+                    f"between {a[:7]} and {b[:7]}"
+                )
+            if not horizontal and gy < 0 and 0 <= gx < MIN_ROW_GAP:
+                raise RuntimeError(
+                    f"Lineage row gap {gx}px < MIN_ROW_GAP {MIN_ROW_GAP}px "
+                    f"between {a[:7]} and {b[:7]}"
+                )
 
-    # Images only — no frames, no labels.
+    # Into a merge: keep each parent's color. Otherwise: child's rail color.
     for cid in order:
-        bx0, by0, _, _ = image_box(cid)
+        parents = [p for p in nodes[cid]["parents"] if p in col_of]
+        is_merge = len(parents) > 1
+        cbx0, cby0, cbx1, cby1 = boxes[cid]
+        if horizontal:
+            end = (float(cbx0), (cby0 + cby1) / 2.0)
+        else:
+            end = ((cbx0 + cbx1) / 2.0, float(cby0))
+        for i, p in enumerate(parents):
+            pbx0, pby0, pbx1, pby1 = boxes[p]
+            if horizontal:
+                start = (float(pbx1), (pby0 + pby1) / 2.0)
+            else:
+                start = ((pbx0 + pbx1) / 2.0, float(pby1))
+            if is_merge:
+                color = node_color(p)
+            else:
+                color = node_color(cid) if i == 0 else node_color(p)
+            _draw_connector(draw, start, end, color, LINE_WIDTH, horizontal=horizontal)
+
+    for cid in order:
+        bx0, by0, _, _ = boxes[cid]
         img.paste(imgs[cid], (bx0, by0))
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     img.save(out_path)
+
 
 
 def render_lineage(
@@ -1060,7 +1236,7 @@ def render_lineage(
     order: list[str],
     refs: dict,
     out_path: Path,
-    orientation: str = "vertical",
+    orientation: str = "horizontal",
 ) -> None:
     if not order:
         raise ValueError("No commits to graph.")
@@ -1189,8 +1365,8 @@ def build_parser():
     p_graph.add_argument(
         "--orientation",
         choices=["vertical", "horizontal"],
-        default="vertical",
-        help="Layout direction: vertical (default, history top→bottom) or horizontal (history left→right)",
+        default="horizontal",
+        help="Layout direction: horizontal (default, history left→right) or vertical (history top→bottom)",
     )
     p_graph.set_defaults(func=cmd_graph)
 

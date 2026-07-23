@@ -929,8 +929,8 @@ def build_parser():
     p_graph.add_argument(
         "--orientation",
         choices=["vertical", "horizontal"],
-        default="vertical",
-        help="Layout direction: vertical (default, history top→bottom) or horizontal (history left→right)",
+        default="horizontal",
+        help="Layout direction: horizontal (default, history left→right) or vertical (history top→bottom)",
     )
     p_graph.set_defaults(func=cmd_graph)
 
